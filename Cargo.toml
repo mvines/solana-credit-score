@@ -1,0 +1,30 @@
+[package]
+name = "solana-credit-score"
+description = "Orders Solana validators by their credit score"
+version = "0.1.0"
+edition = "2021"
+license = "WTFPL"
+publish = false
+
+[features]
+default = []
+# This feature should be made default once
+# https://github.com/solana-labs/solana/pull/28001 is deployed
+correct_zero_commission_handling = []
+
+
+[dependencies]
+clap = { version = "3", features = ["cargo"] }
+log = "0.4.17"
+solana-clap-v3-utils = "=1.14.1"
+solana-cli-config = "=1.14.1"
+solana-client = "=1.14.1"
+solana-logger = "=1.14.1"
+solana-sdk = "=1.14.1"
+solana-transaction-status = "=1.14.1"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+solana-test-validator = "=1.14.1"
+
+[workspace]
