@@ -95,29 +95,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         solana_credit_score::get_validators_by_credit_score(&rpc_client, &epoch_info, epoch)
             .await?;
 
-    let top_staker_credits = validators_by_staker_credits
-        .get(0)
-        .map(|(staker_credits, _)| staker_credits)
-        .copied()
-        .unwrap_or_default() as f64;
+    let staker_credits = validators_by_staker_credits
+        .iter()
+        .map(|(staker_credits, _)| *staker_credits as f64)
+        .collect::<Vec<_>>();
 
+    let top_staker_credits = staker_credits.first().copied().unwrap_or_default();
+
+    let staker_credits = criterion_stats::Distribution::from(staker_credits.into_boxed_slice());
+    let staker_credit_percentiles = staker_credits.percentiles();
+
+    let mut p = 100u8;
     for (i, (staker_credits, vote_pubkey)) in validators_by_staker_credits
         .into_iter()
         .take(num)
         .enumerate()
     {
-        if i == 0 {
-            println!("{}. {:<44}", i, vote_pubkey.to_string())
-        } else {
+        {
+            while p > 0 {
+                let percentile_credits = staker_credit_percentiles.at(p as f64);
+                if staker_credits as f64 >= percentile_credits {
+                    break;
+                }
+                p = p.saturating_sub(1);
+            }
+
             let percent_of_top_staker = staker_credits as f64 * 100. / top_staker_credits;
             println!(
-                "{}. {:<44} ({:5.2}%)",
+                "{:>4}. {:<44} ({:>6.2}%) ({:>3}th percentile)",
                 i,
                 vote_pubkey.to_string(),
-                percent_of_top_staker
+                percent_of_top_staker,
+                p,
             );
         }
     }
-
     Ok(())
 }

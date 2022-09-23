@@ -15,6 +15,7 @@ correct_zero_commission_handling = []
 
 [dependencies]
 clap = { version = "3", features = ["cargo"] }
+criterion-stats = "0.3.0"
 log = "0.4.17"
 solana-clap-v3-utils = "=1.14.1"
 solana-cli-config = "=1.14.1"
