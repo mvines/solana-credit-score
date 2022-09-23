@@ -46,6 +46,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("Limit output to the top N validators [default: all validators]"),
         )
         .arg(
+            Arg::new("max_percentile")
+                .short('p')
+                .long("percentile")
+                .value_name("P")
+                .takes_value(true)
+                .validator(|s| is_parsable::<u8>(s))
+                .default_value("0")
+                .help("Limit output to the validators in the Pth percentile [default: all validators]"),
+        )
+        .arg(
             Arg::new("epoch")
                 .index(1)
                 .value_name("EPOCH")
@@ -71,6 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .value_of("num")
         .map(|s| s.parse::<usize>().unwrap())
         .unwrap_or(usize::MAX);
+    let max_percentile = matches
+        .value_of("max_percentile")
+        .map(|s| s.parse::<u8>().unwrap())
+        .unwrap();
 
     solana_logger::setup_with_default("warn");
     info!("JSON RPC URL: {}", json_rpc_url);
@@ -118,6 +132,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 p = p.saturating_sub(1);
+            }
+
+            if p < max_percentile {
+                break;
             }
 
             let percent_of_top_staker = staker_credits as f64 * 100. / top_staker_credits;
