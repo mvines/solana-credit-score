@@ -142,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{:>4}. {:<44} ({:>6.2}%) ({:>3}th percentile)",
                 i,
-                vote_pubkey.to_string(),
+                vote_pubkey,
                 percent_of_top_staker,
                 p,
             );
