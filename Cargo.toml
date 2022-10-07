@@ -6,13 +6,6 @@ edition = "2021"
 license = "WTFPL"
 publish = false
 
-[features]
-default = []
-# This feature should be made default once
-# https://github.com/solana-labs/solana/pull/28001 is deployed
-correct_zero_commission_handling = []
-
-
 [dependencies]
 clap = { version = "3", features = ["cargo"] }
 criterion-stats = "0.3.0"

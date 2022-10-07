@@ -87,41 +87,12 @@ pub async fn get_validators_by_credit_score(
         vai.epoch_credits.iter().find(|ec| ec.0 == epoch).and_then(|(_, credits, prev_credits)| {
             vai.vote_pubkey.parse::<Pubkey>().ok().and_then(|vote_pubkey| {
 
-                #[cfg(feature = "correct_zero_commission_handling")]
                 let (epoch_commission, epoch_credits) = {
                     let epoch_commission = match &epoch_commissions {
                         Some(epoch_commissions) => *epoch_commissions.get(&vote_pubkey).unwrap(),
                         None => vai.commission
                     };
                     let epoch_credits = credits.saturating_sub(*prev_credits);
-                    (epoch_commission, epoch_credits)
-                };
-
-                #[cfg(not(feature = "correct_zero_commission_handling"))]
-                let (epoch_commission, epoch_credits) = {
-                    // NOTE!! Validators with 0% commissions will not be included in `commissions` for epochs
-                    //        prior to when https://github.com/solana-labs/solana/pull/28001 is deployed to RPC servers
-                    // Assume 0% commission if the vote account is not found in the requested epoch's
-                    // rewards.
-                    //
-                    // This logic should be removed once https://github.com/solana-labs/solana/pull/28001 is deployed
-                    let epoch_commission = match &epoch_commissions {
-                        Some(epoch_commissions) => epoch_commissions.get(&vote_pubkey).copied().unwrap_or_default(),
-                        None => vai.commission
-                    };
-
-                    let epoch_credits = if vai.commission > epoch_commission {
-                        // Out of an abundance of caution, exclude validators that increase their
-                        // commission.
-                        //
-                        // This logic should be removed once https://github.com/solana-labs/solana/pull/28001 is deployed
-                        //
-                        debug!("Excluding {} due to increased commission from {} (at epoch {}) to {} (current)", vote_pubkey, epoch_commission, epoch, vai.commission);
-                        0
-                    } else {
-                        credits.saturating_sub(*prev_credits)
-                    };
-
                     (epoch_commission, epoch_credits)
                 };
 
