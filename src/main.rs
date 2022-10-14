@@ -1,6 +1,8 @@
+mod notifier;
 use {
     clap::{crate_description, crate_name, crate_version, Arg, Command},
     log::*,
+    notifier::*,
     solana_clap_v3_utils::input_validators::{
         is_parsable, is_url_or_moniker, normalize_to_url_if_moniker,
     },
@@ -56,6 +58,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("Limit output to the validators in the Pth percentile [default: all validators]"),
         )
         .arg(
+            Arg::new("ignore_commission")
+                .short('i')
+                .long("ignore-commission")
+                .help("Ignore validator commission")
+        )
+        .arg(
             Arg::new("epoch")
                 .index(1)
                 .value_name("EPOCH")
@@ -85,8 +93,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .value_of("max_percentile")
         .map(|s| s.parse::<u8>().unwrap())
         .unwrap();
+    let ignore_commission = matches.is_present("ignore_commission");
 
     solana_logger::setup_with_default("warn");
+    let notifier = Notifier::default();
+
     info!("JSON RPC URL: {}", json_rpc_url);
 
     let rpc_client =
@@ -105,9 +116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Epoch {}", epoch);
 
-    let validators_by_staker_credits =
-        solana_credit_score::get_validators_by_credit_score(&rpc_client, &epoch_info, epoch)
-            .await?;
+    let validators_by_staker_credits = solana_credit_score::get_validators_by_credit_score(
+        &rpc_client,
+        &epoch_info,
+        epoch,
+        ignore_commission,
+    )
+    .await?;
 
     let staker_credits = validators_by_staker_credits
         .iter()
@@ -120,12 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let staker_credit_percentiles = staker_credits.percentiles();
 
     let mut p = 100u8;
-    for (i, (staker_credits, vote_pubkey)) in validators_by_staker_credits
+    let msg = validators_by_staker_credits
         .into_iter()
         .take(num)
         .enumerate()
-    {
-        {
+        .filter_map(|(i, (staker_credits, vote_pubkey))| {
             while p > 0 {
                 let percentile_credits = staker_credit_percentiles.at(p as f64);
                 if staker_credits as f64 >= percentile_credits {
@@ -135,18 +149,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if p < max_percentile {
-                break;
-            }
+                None
+            } else {
+                let percent_of_top_staker = staker_credits as f64 * 100. / top_staker_credits;
 
-            let percent_of_top_staker = staker_credits as f64 * 100. / top_staker_credits;
-            println!(
-                "{:>4}. {:<44} ({:>6.2}%) ({:>3}th percentile)",
-                i,
-                vote_pubkey,
-                percent_of_top_staker,
-                p,
-            );
-        }
-    }
+                let credits_behind =
+                    (top_staker_credits.floor() as u64).saturating_sub(staker_credits);
+
+                #[allow(clippy::to_string_in_format_args)]
+                let vote_pubkey_str = vote_pubkey.to_string();
+
+                Some(format!(
+                    "{:>4}. {:<44} ({:>6.2}%) ({:>3}th percentile){}",
+                    i + 1,
+                    vote_pubkey_str,
+                    percent_of_top_staker,
+                    p,
+                    if credits_behind > 0 {
+                        format!(" [-{} credits]", credits_behind)
+                    } else {
+                        "".into()
+                    }
+                ))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    println!("{}", msg);
+    notifier.send(&format!("```{}```", msg)).await;
     Ok(())
 }

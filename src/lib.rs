@@ -74,6 +74,7 @@ pub async fn get_validators_by_credit_score(
     rpc_client: &RpcClient,
     epoch_info: &EpochInfo,
     epoch: Epoch,
+    ignore_commission: bool,
 ) -> Result<Vec<(u64, Pubkey)>, Box<dyn std::error::Error>> {
     let epoch_commissions = if epoch == epoch_info.epoch {
         None
@@ -83,34 +84,49 @@ pub async fn get_validators_by_credit_score(
 
     let vote_accounts = rpc_client.get_vote_accounts().await?;
 
-    Ok(vote_accounts.current.into_iter().chain(vote_accounts.delinquent).filter_map(|vai| {
-        vai.epoch_credits.iter().find(|ec| ec.0 == epoch).and_then(|(_, credits, prev_credits)| {
-            vai.vote_pubkey.parse::<Pubkey>().ok().and_then(|vote_pubkey| {
+    Ok(vote_accounts
+        .current
+        .into_iter()
+        .chain(vote_accounts.delinquent)
+        .filter_map(|vai| {
+            vai.epoch_credits.iter().find(|ec| ec.0 == epoch).and_then(
+                |(_, credits, prev_credits)| {
+                    vai.vote_pubkey
+                        .parse::<Pubkey>()
+                        .ok()
+                        .and_then(|vote_pubkey| {
+                            let (epoch_commission, epoch_credits) = {
+                                let epoch_commission = if ignore_commission {
+                                    0
+                                } else {
+                                    match &epoch_commissions {
+                                        Some(epoch_commissions) => {
+                                            *epoch_commissions.get(&vote_pubkey).unwrap()
+                                        }
+                                        None => vai.commission,
+                                    }
+                                };
+                                let epoch_credits = credits.saturating_sub(*prev_credits);
+                                (epoch_commission, epoch_credits)
+                            };
 
-                let (epoch_commission, epoch_credits) = {
-                    let epoch_commission = match &epoch_commissions {
-                        Some(epoch_commissions) => *epoch_commissions.get(&vote_pubkey).unwrap(),
-                        None => vai.commission
-                    };
-                    let epoch_credits = credits.saturating_sub(*prev_credits);
-                    (epoch_commission, epoch_credits)
-                };
-
-                if epoch_credits > 0 {
-                    let staker_credits = (u128::from(epoch_credits) * u128::from(100 - epoch_commission) / 100) as u64;
-                    debug!(
-                        "{}: total credits {}, staker credits {} in epoch {}",
-                        vote_pubkey,
-                        epoch_credits, staker_credits,
-                        epoch,
-                    );
-                    Some((staker_credits, vote_pubkey))
-                } else {
-                    None
-                }
-            })
+                            if epoch_credits > 0 {
+                                let staker_credits =
+                                    (u128::from(epoch_credits) * u128::from(100 - epoch_commission)
+                                        / 100) as u64;
+                                debug!(
+                                    "{}: total credits {}, staker credits {} in epoch {}",
+                                    vote_pubkey, epoch_credits, staker_credits, epoch,
+                                );
+                                Some((staker_credits, vote_pubkey))
+                            } else {
+                                None
+                            }
+                        })
+                },
+            )
         })
-    }).collect::<BTreeMap::<u64,_>>()
+        .collect::<BTreeMap<u64, _>>()
         .into_iter()
         .rev()
         .collect())
