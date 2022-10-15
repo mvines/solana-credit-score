@@ -84,7 +84,7 @@ pub async fn get_validators_by_credit_score(
 
     let vote_accounts = rpc_client.get_vote_accounts().await?;
 
-    Ok(vote_accounts
+    let mut list = vote_accounts
         .current
         .into_iter()
         .chain(vote_accounts.delinquent)
@@ -126,8 +126,8 @@ pub async fn get_validators_by_credit_score(
                 },
             )
         })
-        .collect::<BTreeMap<u64, _>>()
-        .into_iter()
-        .rev()
-        .collect())
+        .collect::<Vec<_>>();
+
+    list.sort_by(|a, b| b.0.cmp(&a.0));
+    Ok(list)
 }
