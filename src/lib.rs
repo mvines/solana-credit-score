@@ -104,43 +104,40 @@ pub async fn get_validators_by_credit_score(
         .into_iter()
         .chain(vote_accounts.delinquent)
         .filter_map(|vai| {
-            vai.vote_pubkey
-                .parse::<Pubkey>()
-                .ok()
-                .map(|vote_pubkey| {
-                    let staker_credits = vai
-                        .epoch_credits
-                        .iter()
-                        .find(|ec| ec.0 == epoch)
-                        .map(|(_, credits, prev_credits)| {
-                            let (epoch_commission, epoch_credits) = {
-                                let epoch_commission = if ignore_commission {
-                                    0
-                                } else {
-                                    match &epoch_commissions {
-                                        Some(epoch_commissions) => {
-                                            *epoch_commissions.get(&vote_pubkey).unwrap()
-                                        }
-                                        None => vai.commission,
+            vai.vote_pubkey.parse::<Pubkey>().ok().map(|vote_pubkey| {
+                let staker_credits = vai
+                    .epoch_credits
+                    .iter()
+                    .find(|ec| ec.0 == epoch)
+                    .map(|(_, credits, prev_credits)| {
+                        let (epoch_commission, epoch_credits) = {
+                            let epoch_commission = if ignore_commission {
+                                0
+                            } else {
+                                match &epoch_commissions {
+                                    Some(epoch_commissions) => {
+                                        *epoch_commissions.get(&vote_pubkey).unwrap()
                                     }
-                                };
-                                let epoch_credits = credits.saturating_sub(*prev_credits);
-                                (epoch_commission, epoch_credits)
+                                    None => vai.commission,
+                                }
                             };
+                            let epoch_credits = credits.saturating_sub(*prev_credits);
+                            (epoch_commission, epoch_credits)
+                        };
 
-                            let staker_credits = (u128::from(epoch_credits)
-                                * u128::from(100 - epoch_commission)
-                                / 100) as u64;
-                            debug!(
-                                "{}: total credits {}, staker credits {} in epoch {}",
-                                vote_pubkey, epoch_credits, staker_credits, epoch,
-                            );
-                            staker_credits
-                        })
-                        .unwrap_or_default();
+                        let staker_credits = (u128::from(epoch_credits)
+                            * u128::from(100 - epoch_commission)
+                            / 100) as u64;
+                        debug!(
+                            "{}: total credits {}, staker credits {} in epoch {}",
+                            vote_pubkey, epoch_credits, staker_credits, epoch,
+                        );
+                        staker_credits
+                    })
+                    .unwrap_or_default();
 
-                    (staker_credits, vote_pubkey, vai.activated_stake)
-                })
+                (staker_credits, vote_pubkey, vai.activated_stake)
+            })
         })
         .collect::<Vec<_>>();
 
