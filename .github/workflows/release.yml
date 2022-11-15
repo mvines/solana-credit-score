@@ -43,7 +43,7 @@ jobs:
       with:
         name: ${{ matrix.target }}
         path: |
-          solana-credit-scores-${{ matrix.target }}
+          solana-credit-score-${{ matrix.target }}
         if-no-files-found: error
 
   publish_release:
