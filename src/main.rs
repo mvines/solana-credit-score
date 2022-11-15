@@ -16,11 +16,22 @@ use {
     },
 };
 
+fn app_version() -> String {
+    let tag = option_env!("GITHUB_REF")
+        .and_then(|github_ref| github_ref.strip_prefix("refs/tags/").map(|s| s.to_string()));
+
+    tag.unwrap_or_else(|| match option_env!("GITHUB_SHA") {
+        None => "devbuild".to_string(),
+        Some(commit) => commit[..8].to_string(),
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app_version = &*app_version();
     let matches = Command::new(crate_name!())
         .about(crate_description!())
-        .version(crate_version!())
+        .version(app_version)
         .arg({
             let arg = Arg::new("config_file")
                 .short('C')
