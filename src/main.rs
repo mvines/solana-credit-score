@@ -7,7 +7,13 @@ use {
         is_parsable, is_url_or_moniker, normalize_to_url_if_moniker,
     },
     solana_client::nonblocking::rpc_client::RpcClient,
-    solana_sdk::commitment_config::CommitmentConfig,
+    solana_sdk::{
+        account::from_account,
+        commitment_config::CommitmentConfig,
+        inflation::Inflation,
+        native_token::Sol,
+        sysvar::stake_history::{self, StakeHistory},
+    },
 };
 
 #[tokio::main]
@@ -69,7 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .value_name("EPOCH")
                 .takes_value(true)
                 .validator(|s| is_parsable::<i64>(s))
-                .help("Epoch to process. Negative values are permitted, e.g. -1 means the previous epoch [default: the current, incomplete, epoch]"),
+                .help("Epoch to process. Negative values are permitted, e.g. -1 means the previous epoch \
+                      [default: the current, incomplete, epoch]"),
         )
         .get_matches();
 
@@ -116,6 +123,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Epoch {}", epoch);
 
+    let inflation = {
+        let rpc_inflation_governor = rpc_client.get_inflation_governor().await?;
+
+        let mut inflation = Inflation::default();
+        inflation.initial = rpc_inflation_governor.initial;
+        inflation.terminal = rpc_inflation_governor.terminal;
+        inflation.taper = rpc_inflation_governor.taper;
+        inflation.foundation = rpc_inflation_governor.foundation;
+        inflation.foundation_term = rpc_inflation_governor.foundation_term;
+        inflation
+    };
+
+    let stake_history = {
+        let stake_history_account = rpc_client.get_account(&stake_history::id()).await?;
+        from_account::<StakeHistory, _>(&stake_history_account)
+            .ok_or("Failed to deserialize stake history")?
+    };
+
+    let estimated_total_supply = rpc_client.supply().await?.value.total;
+
+    let slots_per_year = 78892314.984; // hard coded value from genesis.tar.gz
+    let inflation_activation_slot = 64800004; // slot when the `7XRJcS5Ud5vxGB54JbK9N2vBZVwnwdBNeJW1ibRgD9gx`
+                                              // feature was activated on mainnet
+
+    let first_slot_in_epoch = epoch_info.absolute_slot - epoch_info.slot_index;
+
+    let inflation_num_slots =
+        first_slot_in_epoch - (inflation_activation_slot - epoch_info.slots_in_epoch);
+
+    let inflation_rate = inflation.validator(inflation_num_slots as f64 / slots_per_year);
+    let epoch_duration_in_years = epoch_info.slots_in_epoch as f64 / slots_per_year;
+    let estimated_total_epoch_reward =
+        (inflation_rate * estimated_total_supply as f64 * epoch_duration_in_years) as u64;
+
     let validators_by_staker_credits = solana_credit_score::get_validators_by_credit_score(
         &rpc_client,
         &epoch_info,
@@ -126,8 +167,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let staker_credits = validators_by_staker_credits
         .iter()
-        .map(|(staker_credits, _)| *staker_credits as f64)
+        .map(|(staker_credits, ..)| *staker_credits as f64)
         .collect::<Vec<_>>();
+
+    let total_activated_stake = if epoch == epoch_info.epoch {
+        validators_by_staker_credits
+            .iter()
+            .map(|(.., activated_stake)| *activated_stake as u64)
+            .sum::<u64>()
+    } else {
+        stake_history
+            .get(epoch)
+            .ok_or_else(|| format!("Stake history unavailable for epoch {}", epoch))?
+            .effective
+    };
+
+    let total_points = validators_by_staker_credits
+        .iter()
+        .map(|(staker_credits, .., activated_stake)| {
+            u128::from(*staker_credits) * u128::from(*activated_stake)
+        })
+        .sum::<u128>();
 
     let top_staker_credits = staker_credits.first().copied().unwrap_or_default();
 
@@ -139,7 +199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .take(num)
         .enumerate()
-        .filter_map(|(i, (staker_credits, vote_pubkey))| {
+        .filter_map(|(i, (staker_credits, vote_pubkey, activated_stake))| {
             while p > 0 {
                 let percentile_credits = staker_credit_percentiles.at(p as f64);
                 if staker_credits as f64 >= percentile_credits {
@@ -156,11 +216,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let credits_behind =
                     (top_staker_credits.floor() as u64).saturating_sub(staker_credits);
 
+                let current_epoch_estimates = if epoch_info.epoch == epoch {
+                    let points = u128::from(activated_stake) * u128::from(staker_credits);
+
+                    let estimated_epoch_reward =
+                        (estimated_total_epoch_reward as u128 * points / total_points) as u64;
+
+                    let expected_epoch_reward = u128::from(estimated_total_epoch_reward)
+                        * u128::from(activated_stake)
+                        / u128::from(total_activated_stake);
+
+                    format!(
+                        "| estimated {} (expected: {})",
+                        Sol(estimated_epoch_reward),
+                        Sol(expected_epoch_reward as u64),
+                    )
+                } else {
+                    "".into()
+                };
+
                 #[allow(clippy::to_string_in_format_args)]
                 let vote_pubkey_str = vote_pubkey.to_string();
 
                 Some(format!(
-                    "{:>4}. {:<44} ({:>6.2}%) ({:>3}th percentile){}",
+                    "{:>4}. {:<44} ({:>6.2}%) ({:>3}th percentile){} {}",
                     i + 1,
                     vote_pubkey_str,
                     percent_of_top_staker,
@@ -169,7 +248,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format!(" [-{} credits]", credits_behind)
                     } else {
                         "".into()
-                    }
+                    },
+                    current_epoch_estimates,
                 ))
             }
         })

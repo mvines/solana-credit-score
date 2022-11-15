@@ -1,7 +1,9 @@
 use {
     log::*,
     solana_client::{
-        nonblocking::rpc_client::RpcClient, rpc_config::RpcBlockConfig, rpc_custom_error,
+        nonblocking::rpc_client::RpcClient,
+        rpc_config::{RpcBlockConfig, RpcGetVoteAccountsConfig},
+        rpc_custom_error,
     },
     solana_sdk::{clock::Epoch, epoch_info::EpochInfo, pubkey::Pubkey, reward_type::RewardType},
     solana_transaction_status::Reward,
@@ -75,26 +77,42 @@ pub async fn get_validators_by_credit_score(
     epoch_info: &EpochInfo,
     epoch: Epoch,
     ignore_commission: bool,
-) -> Result<Vec<(u64, Pubkey)>, Box<dyn std::error::Error>> {
+) -> Result<
+    Vec<(
+        /* credits: */ u64,
+        /* vote_pubkey: */ Pubkey,
+        /* activated_stake_for_current_epoch: */ u64,
+    )>,
+    Box<dyn std::error::Error>,
+> {
     let epoch_commissions = if epoch == epoch_info.epoch {
         None
     } else {
         Some(get_epoch_commissions(rpc_client, epoch_info, epoch).await?)
     };
 
-    let vote_accounts = rpc_client.get_vote_accounts().await?;
+    let vote_accounts = rpc_client
+        .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
+            commitment: Some(rpc_client.commitment()),
+            keep_unstaked_delinquents: Some(true),
+            ..RpcGetVoteAccountsConfig::default()
+        })
+        .await?;
 
     let mut list = vote_accounts
         .current
         .into_iter()
         .chain(vote_accounts.delinquent)
         .filter_map(|vai| {
-            vai.epoch_credits.iter().find(|ec| ec.0 == epoch).and_then(
-                |(_, credits, prev_credits)| {
-                    vai.vote_pubkey
-                        .parse::<Pubkey>()
-                        .ok()
-                        .and_then(|vote_pubkey| {
+            vai.vote_pubkey
+                .parse::<Pubkey>()
+                .ok()
+                .map(|vote_pubkey| {
+                    let staker_credits = vai
+                        .epoch_credits
+                        .iter()
+                        .find(|ec| ec.0 == epoch)
+                        .map(|(_, credits, prev_credits)| {
                             let (epoch_commission, epoch_credits) = {
                                 let epoch_commission = if ignore_commission {
                                     0
@@ -110,21 +128,19 @@ pub async fn get_validators_by_credit_score(
                                 (epoch_commission, epoch_credits)
                             };
 
-                            if epoch_credits > 0 {
-                                let staker_credits =
-                                    (u128::from(epoch_credits) * u128::from(100 - epoch_commission)
-                                        / 100) as u64;
-                                debug!(
-                                    "{}: total credits {}, staker credits {} in epoch {}",
-                                    vote_pubkey, epoch_credits, staker_credits, epoch,
-                                );
-                                Some((staker_credits, vote_pubkey))
-                            } else {
-                                None
-                            }
+                            let staker_credits = (u128::from(epoch_credits)
+                                * u128::from(100 - epoch_commission)
+                                / 100) as u64;
+                            debug!(
+                                "{}: total credits {}, staker credits {} in epoch {}",
+                                vote_pubkey, epoch_credits, staker_credits, epoch,
+                            );
+                            staker_credits
                         })
-                },
-            )
+                        .unwrap_or_default();
+
+                    (staker_credits, vote_pubkey, vai.activated_stake)
+                })
         })
         .collect::<Vec<_>>();
 
