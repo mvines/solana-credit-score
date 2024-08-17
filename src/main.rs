@@ -1,12 +1,15 @@
+mod latitude;
 mod notifier;
 use {
-    clap::{crate_description, crate_name, crate_version, Arg, Command},
+    crate::latitude::Latitude,
+    clap::{crate_description, crate_name, value_parser, Arg, Command},
     log::*,
     notifier::*,
-    solana_clap_v3_utils::input_validators::{
-        is_parsable, is_url_or_moniker, normalize_to_url_if_moniker,
+    solana_clap_v3_utils::{
+        input_parsers::parse_url_or_moniker, input_validators::normalize_to_url_if_moniker,
     },
     solana_client::nonblocking::rpc_client::RpcClient,
+    solana_credit_score::get_validator_status,
     solana_sdk::{
         account::from_account,
         commitment_config::CommitmentConfig,
@@ -52,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .long("url")
                 .value_name("URL")
                 .takes_value(true)
-                .validator(|s| is_url_or_moniker(s))
+                .validator(|s| parse_url_or_moniker(s))
                 .help("JSON RPC URL for the cluster [default: value from configuration file]"),
         )
         .arg(
@@ -61,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .long("num")
                 .value_name("N")
                 .takes_value(true)
-                .validator(|s| is_parsable::<usize>(s))
+                .value_parser(value_parser!(usize))
                 .help("Limit output to the top N validators [default: all validators]"),
         )
         .arg(
@@ -70,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .long("percentile")
                 .value_name("P")
                 .takes_value(true)
-                .validator(|s| is_parsable::<u8>(s))
+                .value_parser(value_parser!(u8))
                 .default_value("0")
                 .help("Limit output to the validators in the Pth percentile [default: all validators]"),
         )
@@ -81,11 +84,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("Ignore validator commission")
         )
         .arg(
+            Arg::with_name("identity")
+                .short('k')
+                .long("identity")
+                .value_name("IDENTITY")
+                .global(true)
+                .takes_value(true)
+                .help("Validator identity string"),
+        )
+        .arg(
+            Arg::with_name("reason")
+                .short('r')
+                .long("reason")
+                .value_name("REASON")
+                .global(true)
+                .takes_value(true)
+                .help("Reason for calling the program [hourly, daily, new_epoch]"),
+        )
+        .arg(
             Arg::new("epoch")
                 .index(1)
                 .value_name("EPOCH")
                 .takes_value(true)
-                .validator(|s| is_parsable::<i64>(s))
+                .value_parser(value_parser!(i64))
                 .help("Epoch to process. Negative values are permitted, e.g. -1 means the previous epoch \
                       [default: the current, incomplete, epoch]"),
         )
@@ -107,16 +128,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .value_of("num")
         .map(|s| s.parse::<usize>().unwrap())
         .unwrap_or(usize::MAX);
-    let max_percentile = matches
-        .value_of("max_percentile")
-        .map(|s| s.parse::<u8>().unwrap())
-        .unwrap();
+    let max_percentile: u8 = *matches.get_one("max_percentile").unwrap();
     let ignore_commission = matches.is_present("ignore_commission");
 
     solana_logger::setup_with_default("warn");
     let notifier = Notifier::default();
 
     info!("JSON RPC URL: {}", json_rpc_url);
+
+    let validator_vote_id = matches.value_of("identity");
 
     let rpc_client =
         RpcClient::new_with_commitment(json_rpc_url.clone(), CommitmentConfig::finalized());
@@ -133,6 +153,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("Epoch {}", epoch);
+
+    let latitude = Latitude::default();
+
+    if let Some(validator_vote_id) = validator_vote_id {
+        let status =
+            get_validator_status(&rpc_client, validator_vote_id, &epoch_info, epoch).await?;
+        // println!("result {:?}", status);
+        let status = if let Some(status) = status {
+            status
+        } else {
+            notifier
+                .send(&format!(
+                    "```Alert!! validator not found {}```",
+                    validator_vote_id
+                ))
+                .await;
+            return Ok(());
+        };
+
+        let bandwidth_usage = latitude.get_bandwidth_usage().unwrap_or_default();
+
+        let msg = if let Some(reason) = matches.value_of("reason") {
+            match reason {
+                "hourly" => {
+                    if status.is_delinquent
+                        || status.skip_rate > 4.0
+                        || status.vote_distance > 40
+                        || bandwidth_usage.inbound_usage > 70
+                        || bandwidth_usage.outbound_usage > 70
+                    {
+                        format!(
+                            "```Alert!!\
+                            \n{:?}\
+                            \nNetwork status\
+                            \n{:?}\
+                            ```",
+                            status, bandwidth_usage,
+                        )
+                    } else {
+                        "".to_string()
+                    }
+                }
+                "daily" => {
+                    format!(
+                        "```Current epoch status\
+                            \n{:?}\
+                            \nNetwork status\
+                            \n{:?}\
+                            ```",
+                        status, bandwidth_usage,
+                    )
+                }
+                "new_epoch" => {
+                    let last_epoch_status = get_validator_status(
+                        &rpc_client,
+                        validator_vote_id,
+                        &epoch_info,
+                        epoch.saturating_sub(1),
+                    )
+                    .await?;
+                    // println!("result {:?}", last_epoch_status);
+                    if let Some(last_epoch_status) = last_epoch_status {
+                        format!(
+                            "```Last epoch status\
+                            \n{:?}\
+                            \nCurrent epoch status\
+                            \n{:?}\
+                            \nNetwork status\
+                            \n{:?}\
+                            ```",
+                            last_epoch_status, status, bandwidth_usage,
+                        )
+                    } else {
+                        format!("```Alert!! validator not found {}```", validator_vote_id)
+                    }
+                }
+                _ => "".to_string(),
+            }
+        } else {
+            "".to_string()
+        };
+        println!("{}", msg);
+        if msg.len() != 0 {
+            notifier.send(&msg).await;
+        }
+
+        return Ok(());
+    }
 
     let inflation = {
         let rpc_inflation_governor = rpc_client.get_inflation_governor().await?;

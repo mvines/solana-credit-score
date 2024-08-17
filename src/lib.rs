@@ -2,12 +2,21 @@ use {
     log::*,
     solana_client::{
         nonblocking::rpc_client::RpcClient,
-        rpc_config::{RpcBlockConfig, RpcGetVoteAccountsConfig},
+        rpc_config::{
+            RpcBlockConfig, RpcBlockProductionConfig, RpcBlockProductionConfigRange,
+            RpcGetVoteAccountsConfig, RpcLeaderScheduleConfig,
+        },
         rpc_custom_error,
     },
-    solana_sdk::{clock::Epoch, epoch_info::EpochInfo, pubkey::Pubkey, reward_type::RewardType},
+    solana_sdk::{
+        clock::Epoch, epoch_info::EpochInfo, native_token::LAMPORTS_PER_SOL, pubkey::Pubkey,
+        reward_type::RewardType,
+    },
     solana_transaction_status::Reward,
-    std::collections::BTreeMap,
+    std::{
+        collections::BTreeMap,
+        fmt::{Debug, Formatter},
+    },
 };
 
 async fn get_epoch_commissions(
@@ -70,6 +79,154 @@ async fn get_epoch_commissions(
     }
 }
 
+pub struct ValidatorStatus {
+    pub epoch: Epoch,
+    pub epoch_progress: u64,
+    pub credits: u64,
+    pub vote_distance: u64,
+    pub delegated_stake: u64,
+    pub leader_slots_count: usize,
+    pub leader_slots_elapsed: usize,
+    pub blocks_produced: usize,
+    pub skip_rate: f64,
+    pub is_delinquent: bool,
+}
+
+impl Debug for ValidatorStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "\tEpoch {} is {}% over\n\
+            \tThe node is {}\n\
+            \t{} SOLs are staked\n\
+            \t{} total leader slots\n\
+            \t{} produced out of {}\n\
+            \t{:.2}% skip rate\n\
+            \t{} vote distance\n\
+            \t{} vote credits\n",
+            self.epoch,
+            self.epoch_progress,
+            self.is_delinquent
+                .then_some("!! delinquent !!")
+                .or_else(|| Some("not delinquent"))
+                .unwrap(),
+            self.delegated_stake,
+            self.leader_slots_count,
+            self.blocks_produced,
+            self.leader_slots_elapsed,
+            self.skip_rate,
+            self.vote_distance,
+            self.credits,
+        )
+    }
+}
+
+pub async fn get_validator_status(
+    rpc_client: &RpcClient,
+    vote_pubkey: &str,
+    epoch_info: &EpochInfo,
+    epoch: Epoch,
+) -> Result<Option<ValidatorStatus>, Box<dyn std::error::Error>> {
+    let vote_accounts = rpc_client
+        .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
+            vote_pubkey: Some(vote_pubkey.to_string()),
+            commitment: Some(rpc_client.commitment()),
+            keep_unstaked_delinquents: Some(false),
+            ..RpcGetVoteAccountsConfig::default()
+        })
+        .await?;
+
+    let is_delinquent = vote_accounts.current.is_empty();
+    let account = if is_delinquent {
+        vote_accounts.delinquent.first()
+    } else {
+        vote_accounts.current.first()
+    };
+
+    let account = if let Some(account) = account {
+        account
+    } else {
+        return Ok(None);
+    };
+
+    let vote_distance = account.last_vote - account.root_slot;
+    let delegated_stake = account.activated_stake / LAMPORTS_PER_SOL;
+    let credits = account
+        .epoch_credits
+        .iter()
+        .find(|(e, _, _)| e == &epoch)
+        .map(|(_, credits, prev_credits)| credits.saturating_sub(*prev_credits))
+        .unwrap_or_default();
+
+    let identity = &account.node_pubkey;
+
+    let first_slot_in_epoch = epoch_info
+        .absolute_slot
+        .saturating_sub(epoch_info.slot_index)
+        - (epoch_info.epoch - epoch) * epoch_info.slots_in_epoch;
+    let last_slot = first_slot_in_epoch
+        .saturating_add(epoch_info.slots_in_epoch)
+        .min(epoch_info.absolute_slot);
+
+    let (leader_slots_elapsed, blocks_produced, skip_rate) = rpc_client
+        .get_block_production_with_config(RpcBlockProductionConfig {
+            identity: Some(identity.clone()),
+            range: Some(RpcBlockProductionConfigRange {
+                first_slot: first_slot_in_epoch,
+                last_slot: Some(last_slot),
+            }),
+            ..RpcBlockProductionConfig::default()
+        })
+        .await?
+        .value
+        .by_identity
+        .into_iter()
+        .find(|(leader, (_, _))| leader == identity)
+        .map(|(_, (leader_slots, blocks_produced))| {
+            (
+                leader_slots,
+                blocks_produced,
+                100. * (leader_slots.saturating_sub(blocks_produced)) as f64 / leader_slots as f64,
+            )
+        })
+        .unwrap_or_default();
+
+    let leader_schedule = rpc_client
+        .get_leader_schedule_with_config(
+            Some(first_slot_in_epoch),
+            RpcLeaderScheduleConfig {
+                identity: Some(identity.clone()),
+                commitment: None,
+            },
+        )
+        .await?;
+
+    let leader_slots_count = if let Some(schedule) = leader_schedule {
+        schedule.get(identity).map(|v| v.len()).unwrap_or_default()
+    } else {
+        0
+    };
+
+    let epoch_progress = if epoch_info.epoch > epoch {
+        100
+    } else {
+        epoch_info.slot_index * 100 / epoch_info.slots_in_epoch
+    };
+
+    Ok(Some(ValidatorStatus {
+        epoch,
+        epoch_progress,
+        credits,
+        vote_distance,
+        delegated_stake,
+        leader_slots_count,
+        leader_slots_elapsed,
+        blocks_produced,
+        skip_rate,
+        is_delinquent,
+    }))
+}
+
 /// Returns a `Vec` of ("epoch staker credits earned", "validator vote account address"), ordered
 /// by epoch staker credits earned.
 pub async fn get_validators_by_credit_score(
@@ -94,7 +251,7 @@ pub async fn get_validators_by_credit_score(
     let vote_accounts = rpc_client
         .get_vote_accounts_with_config(RpcGetVoteAccountsConfig {
             commitment: Some(rpc_client.commitment()),
-            keep_unstaked_delinquents: Some(true),
+            keep_unstaked_delinquents: Some(false),
             ..RpcGetVoteAccountsConfig::default()
         })
         .await?;
